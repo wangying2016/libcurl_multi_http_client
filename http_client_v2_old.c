@@ -57,7 +57,6 @@ char *urls[] = {
   "https://www.un.org",
 };
 
-
 #define MAX_PARALLEL 10  
 #define NUM_URLS sizeof(urls)/sizeof(char *)
 #define MAX_URL_LENGTH 1024
@@ -65,19 +64,25 @@ char *urls[] = {
 // response struct
 struct res_info {
     int index;
-    // 0: initial 1: can consume 2: consume end
+    // 0: initial 1: consume end
     int consumable;
     char url[MAX_URL_LENGTH];
 };
 
-// response mutex
-pthread_mutex_t res_mutex = PTHREAD_MUTEX_INITIALIZER;
-
 // response
 struct res_info res_list[NUM_URLS];
 
+// multi handle
+CURLM *cm;
+
 // url index
 unsigned int transfers = 0;
+
+// on-going request
+unsigned int doing_cnt = 0;
+
+// cnt mutex
+pthread_mutex_t cnt_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // request callback
 static size_t write_cb(char *data, size_t n, size_t l, void *userp)
@@ -86,17 +91,6 @@ static size_t write_cb(char *data, size_t n, size_t l, void *userp)
   (void)data;
   (void)userp;
   return n*l;
-}
- 
-// add request
-static void add_transfer(CURLM *cm, int i)
-{
-  CURL *eh = curl_easy_init();
-  curl_easy_setopt(eh, CURLOPT_WRITEFUNCTION, write_cb);
-  curl_easy_setopt(eh, CURLOPT_URL, urls[i]);
-  curl_easy_setopt(eh, CURLOPT_TIMEOUT, 10L);
-  curl_easy_setopt(eh, CURLOPT_PRIVATE, urls[i]);
-  curl_multi_add_handle(cm, eh);
 }
 
 // find index
@@ -108,44 +102,31 @@ int find_index_of_urls(char *url) {
     }
     return 0;
 }
-
-// add response
-void add_response(struct res_info res) {
-    int i = 0;
-    pthread_mutex_lock(&res_mutex);
-    res_list[res.index] = res;
-    res_list[res.index].consumable = 1;
-    // sleep(1);
-    pthread_mutex_unlock(&res_mutex);
-}
-
-// consume response
-void consume_response() {
-    int i;
-    pthread_mutex_lock(&res_mutex);
-    for (i = 0; i < NUM_URLS; ++i) {
-        // printf("res_list: index = [%d], consumable = [%d], url = [%s]\n", res_list[i].index, \
-        //     res_list[i].consumable, res_list[i].url);
-        if (res_list[i].consumable == 1) {
-            printf("Log: t2, consume response, index [%d], url [%s]\n", res_list[i].index, res_list[i].url);
-            res_list[i].consumable = 2;
-        }
-    }
-    pthread_mutex_unlock(&res_mutex);
+ 
+// add request
+static void add_transfer(int i)
+{
+    CURL *eh = curl_easy_init();
+    curl_easy_setopt(eh, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(eh, CURLOPT_URL, urls[i]);
+    curl_easy_setopt(eh, CURLOPT_TIMEOUT, 10L);
+    curl_easy_setopt(eh, CURLOPT_PRIVATE, urls[i]);
+    curl_multi_add_handle(cm, eh);
+    pthread_mutex_lock(&cnt_mutex);
+    doing_cnt++;
+    pthread_mutex_unlock(&cnt_mutex);
 }
 
 // check consume finished
 int check_consume_finished() {
     int i, finished;
     finished = 1;
-    pthread_mutex_lock(&res_mutex);
     for (i = 0; i < NUM_URLS; ++i) {
-        if (res_list[i].consumable != 2) {
+        if (res_list[i].consumable != 1) {
             finished = 0;
             break;
         }
     }
-    pthread_mutex_unlock(&res_mutex);
     return finished;
 }
 
@@ -153,29 +134,24 @@ int check_consume_finished() {
 void *fun1() {
     printf("Log: t1 begin...\n");
 
-    CURLM *cm;
-    CURLMsg *msg;
+    int still_alive = 1;
     long L;
     unsigned int C=0;
-    int M, msgs_left, still_alive = -1;
+    int M, msgs_left;
     fd_set R, W, E;
     struct timeval T;
-
-    curl_global_init(CURL_GLOBAL_ALL);
-
-    cm = curl_multi_init();
-
-    /* we can optionally limit the total amount of connections this multi handle
-        uses */
+    
+    /* Limit the amount of simultaneous connections curl should allow: */ 
     curl_multi_setopt(cm, CURLMOPT_MAXCONNECTS, (long)MAX_PARALLEL);
 
-    for (transfers = 0; transfers < MAX_PARALLEL; ++transfers) {
-        add_transfer(cm, transfers);
+    for(transfers = 0; transfers < MAX_PARALLEL; transfers++) {
+        add_transfer(transfers);
+        printf("Log: t1, add request, index = [%d], url = [%s]\n", \
+            find_index_of_urls(urls[transfers]), urls[transfers]);
     }
-
-    while (still_alive) {
-        while (CURLM_CALL_MULTI_PERFORM == curl_multi_perform(cm, &still_alive));
-
+    
+    do {
+        curl_multi_perform(cm, &still_alive);
         if (still_alive) {
             FD_ZERO(&R);
             FD_ZERO(&W);
@@ -206,32 +182,16 @@ void *fun1() {
                 }
             }
         }
-
-        while ((msg = curl_multi_info_read(cm, &msgs_left))) {
-            if (msg->msg == CURLMSG_DONE) {
-                struct res_info res;
-                char *url;
-                CURL *e = msg->easy_handle;
-                curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, &url);
-                strcpy(res.url, url);
-                res.index = find_index_of_urls(res.url);
-                add_response(res);
-                printf("Log: t1, add response, error number [%d], error messsage [%s], url [%s], "
-                        "index [%d]\n", msg->data.result, curl_easy_strerror(msg->data.result), res.url,  \
-                            res.index);
-                curl_multi_remove_handle(cm, e);
-                curl_easy_cleanup(e);
-            }
-            else {
-                printf("Log: t1, request error, error number [%d]\n", msg->msg);
-            }
-            if (transfers < NUM_URLS) {
-                add_transfer(cm, transfers++);
-                still_alive++; /* just to prevent it from remaining at 0 if there are more
+        if(transfers < NUM_URLS && doing_cnt < MAX_PARALLEL) {
+            add_transfer(transfers);
+            printf("Log: t1, add request, index = [%d], url = [%s]\n", \
+                find_index_of_urls(urls[transfers]), urls[transfers]);
+            transfers++;
+            still_alive++; /* just to prevent it from remaining at 0 if there are more
                         URLs to get */
-            }
         }
-    }
+        // sleep(1);
+    } while(still_alive || (transfers < NUM_URLS));
 
     printf("Log: t1 end...\n");
 }
@@ -239,11 +199,36 @@ void *fun1() {
 // t2's thread function
 void *fun2() {
     int i = 0;
+    int msgs_left = -1;
+    CURLMsg *msg;
     
     printf("Log: t2 begin...\n");
     do {
-        consume_response();
-        sleep(1);
+        while((msg = curl_multi_info_read(cm, &msgs_left))) {
+            if(msg->msg == CURLMSG_DONE) {
+                char *url;
+                CURL *e = msg->easy_handle;
+                curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, &url);
+
+                struct res_info res;
+                strcpy(res.url, url);
+                res.index = find_index_of_urls(res.url);
+                res.consumable = 1;
+                res_list[res.index] = res;
+                printf("Log: t2, accept response, index [%d], url [%s], error number [%d], error messsage [%s]\n", \
+                    res.index, res.url, msg->data.result, curl_easy_strerror(msg->data.result));
+
+                curl_multi_remove_handle(cm, e);
+                curl_easy_cleanup(e);
+            }
+            else {
+                printf("Log: t2, request error, error number [%d]\n", msg->msg);
+            }
+            pthread_mutex_lock(&cnt_mutex);
+            doing_cnt--;
+            pthread_mutex_unlock(&cnt_mutex);
+        }
+        // sleep(1);
     } while (!check_consume_finished());
     printf("Log: t2 end...\n");
 }
@@ -258,6 +243,10 @@ int main() {
         res_list[i].consumable = 0;
         strcpy(res_list[i].url, "");
     }
+
+    // Initialize multi handle
+    curl_global_init(CURL_GLOBAL_ALL);
+    cm = curl_multi_init();
 
     // Create two thread
     ret = pthread_create(&t1, NULL, fun1, NULL);
@@ -290,6 +279,10 @@ int main() {
     } else {
         printf("Log: Join thread t2 Successed!\n");
     }
+
+    // Clean mutli handle
+    curl_multi_cleanup(cm);
+    curl_global_cleanup();
 
     printf("Log: main thread end...\n");
     return 0;
